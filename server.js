@@ -38,16 +38,24 @@ app.post("/api/audit", async (req, res) => {
         // ------------------------------
         // REIMBURSEMENT AUDIT PROMPT
         // ------------------------------
-        const prompt = `
-You are an Amazon FBA reimbursement auditor.
+// ------------------------------
+// PREPROCESS CSV BEFORE SENDING TO GEMINI
+// ------------------------------
+const { rows } = preprocessCSV(csvContent);
 
-Your job:
-• Detect ONLY legitimate claims Amazon must reimburse.
-• A claim must include: sku, reason, quantity, estimatedValue
+const prompt = `
+You are an Amazon FBA Reimbursement Auditor.
+
+Analyze ONLY the structured rows below.
+Do NOT rely on raw CSV formatting, only on the fields provided.
+
+Input rows:
+${JSON.stringify(rows, null, 2)}
+
+Rules:
+• A valid claim must include: sku, reason, quantity, estimatedValue.
 • estimatedValue = quantity * 8.50
-
-Return ONLY valid JSON. No commentary. No markdown.
-Format:
+• Return ONLY pure JSON array like:
 
 [
   {
@@ -58,11 +66,9 @@ Format:
   }
 ]
 
-If no claims exist, return: []
-
---- RAW INVENTORY ADJUSTMENT DATA (TRUNCATED TO 25,000 CHARS) ---
-${csvContent.substring(0, 25000)}
-        `;
+If no valid claims exist, return [].
+No comments. No markdown. No text outside JSON.
+`;
 
         // ------------------------------
         // GEMINI PAYLOAD
@@ -153,4 +159,5 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () =>
     console.log(`RefundHunter backend running on port ${PORT}`)
 );
+
 
