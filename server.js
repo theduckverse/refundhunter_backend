@@ -121,8 +121,7 @@ No comments. No markdown. No text outside JSON.
         let claims = [];
         try {
             claims = JSON.parse(clean);
-
-            if (!Array.isArray(claims)) throw new Error("AI did not return array");
+            claims = validateClaims(claims);
         } catch (err) {
             console.error("JSON PARSE FAIL:", clean);
             return res.status(500).json({
@@ -160,6 +159,7 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () =>
     console.log(`RefundHunter backend running on port ${PORT}`)
 );
+
 
 
 
