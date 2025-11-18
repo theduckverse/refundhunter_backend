@@ -6,6 +6,7 @@ import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import { preprocessCSV } from "./utils/parseCSV.js";
+import { validateClaims } from "./utils/validateClaims.js";
 
 const app = express();
 app.use(cors());
@@ -159,5 +160,6 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () =>
     console.log(`RefundHunter backend running on port ${PORT}`)
 );
+
 
 
