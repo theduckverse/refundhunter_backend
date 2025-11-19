@@ -28,11 +28,11 @@ app.get("/", (req, res) => {
 // ------------------------------
 app.post("/api/audit", async (req, res) => {
   try {
-    const { csvContent, fileName, userId } = req.body;
+const { csvContent, fileName, userId } = req.body;
 
-    if (!csvContent) {
-      return res.status(400).json({ error: "Missing CSV content." });
-    }
+if (!userId || userId === "anonymous") {
+    return res.status(403).json({ error: "User not authenticated." });
+}
 
     // ------------------------------
     // PREPROCESS CSV BEFORE SENDING TO GEMINI
@@ -223,3 +223,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () =>
   console.log(`RefundHunter backend running on port ${PORT}`)
 );
+
