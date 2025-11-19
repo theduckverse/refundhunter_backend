@@ -43,6 +43,7 @@ app.post("/api/audit", async (req, res) => {
 // PREPROCESS CSV BEFORE SENDING TO GEMINI
 // ------------------------------
 const { rows } = preprocessCSV(csvContent);
+console.log("PARSED CSV ROWS:", rows);
 
 const prompt = `
 You are an Amazon FBA Reimbursement Auditor.
@@ -159,6 +160,7 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () =>
     console.log(`RefundHunter backend running on port ${PORT}`)
 );
+
 
 
 
