@@ -1,14 +1,21 @@
-export default function validateClaims(claims) {
+export function validateClaims(claims) {
     if (!Array.isArray(claims)) return [];
 
-    return claims.filter(c => {
-        return (
-            typeof c.sku === "string" &&
-            typeof c.reason === "string" &&
-            typeof c.quantity === "number" &&
-            typeof c.estimatedValue === "number" &&
-            c.quantity > 0 &&
-            c.estimatedValue >= 0
-        );
-    });
+    return claims
+        .filter((claim) => {
+            return (
+                claim &&
+                claim.sku &&
+                claim.claimReason &&
+                claim.estimatedValue &&
+                !isNaN(parseFloat(claim.estimatedValue))
+            );
+        })
+        .map((claim) => ({
+            sku: claim.sku.trim(),
+            claimReason: claim.claimReason.trim(),
+            estimatedValue: parseFloat(claim.estimatedValue),
+            quantity: claim.quantity || 1,
+            amazonTransactionId: claim.amazonTransactionId || "N/A",
+        }));
 }
