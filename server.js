@@ -213,20 +213,27 @@ app.post("/api/create-checkout-session", async (req, res) => {
     }
 
     const session = await stripe.checkout.sessions.create({
-      mode: "subscription", // or "payment" if using one-time
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
-      customer_email: email || undefined,
-      success_url: `${FRONTEND_URL}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${FRONTEND_URL}?canceled=1`,
-      metadata: {
-        firebaseUserId: userId,
-      },
-    });
+  mode: "subscription",
+
+  payment_method_types: ["card", "link"],  // 🔥 THIS FIXES THE ISSUE
+
+  line_items: [
+    {
+      price: priceId,
+      quantity: 1,
+    },
+  ],
+
+  customer_email: email || undefined,
+
+  success_url: `${FRONTEND_URL}?session_id={CHECKOUT_SESSION_ID}`,
+  cancel_url: `${FRONTEND_URL}?canceled=1`,
+
+  metadata: {
+    firebaseUserId: userId,
+  },
+});
+
 
     return res.json({ url: session.url });
   } catch (err) {
@@ -297,3 +304,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () =>
   console.log(`🚀 FBA Money Scout backend running on port ${PORT}`)
 );
+
