@@ -328,22 +328,21 @@ app.post(
         default:
           console.log("ℹ️ Unhandled event:", event.type);
       }
-
-      res.json({ received: true });
-    } catch (err) {
-      console.error("❌ Error handling webhook:", err);
-      res.status(500).send("Webhook handler error");
-    }
+    res.json({ received: true });
+  } catch (err) {
+    console.error("❌ Error handling webhook:", err);
+    return res.status(500).send("Webhook handler error");
   }
-);
-
-
+});
 // ------------------------------
 // START SERVER
 // ------------------------------
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () =>
-  console.log(`🚀 FBA Money Scout backend running on port ${PORT}`)
-);
+
+app.listen(PORT, () => {
+  console.log(`🚀 FBA Money Scout backend running on port ${PORT}`);
+});
+
+
 
 
