@@ -1,210 +1,299 @@
-// ==============================
-// ========== IMPORTS ===========
-// ==============================
+// server.js  (Node 18+, "type": "module" in package.json)
+
 import express from "express";
 import cors from "cors";
+import fetch from "node-fetch";
 import Stripe from "stripe";
-import { fileURLToPath } from "url";
-import { dirname } from "path";
+import admin from "firebase-admin";
 
-import {
-  initializeApp,
-  cert
-} from "firebase-admin/app";
+import { preprocessCSV } from "./utils/parseCSV.js";
+import { validateClaims } from "./utils/validateClaims.js";
 
-import {
-  getFirestore,
-  FieldValue,
-} from "firebase-admin/firestore";
+// ------------------------------
+// ENV CONFIG (Render Dashboard → Environment)
+// ------------------------------
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const FIREBASE_SERVICE_ACCOUNT = process.env.FIREBASE_SERVICE_ACCOUNT; // JSON string
+const FRONTEND_URL =
+  process.env.FRONTEND_URL ||
+  "https://theduckverse.github.io/RefundHunter/"; // change if you rename the GH page
 
-import parseCSV from "./utils/parseCSV.js";
-import validateClaims from "./utils/validateClaims.js";
+if (!GEMINI_API_KEY) {
+  console.warn("⚠️ Missing GEMINI_API_KEY env variable.");
+}
+if (!STRIPE_SECRET_KEY) {
+  console.warn("⚠️ Missing STRIPE_SECRET_KEY env variable.");
+}
+if (!STRIPE_WEBHOOK_SECRET) {
+  console.warn("⚠️ Missing STRIPE_WEBHOOK_SECRET env variable.");
+}
 
-// ==============================
-// ========== CONSTANTS =========
-// ==============================
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const stripe = new Stripe(STRIPE_SECRET_KEY, {
+  apiVersion: "2024-06-20",
+});
 
+// ------------------------------
+// FIREBASE ADMIN (for premium flag)
+// ------------------------------
+let firestore = null;
+
+if (FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    const serviceAccount = JSON.parse(FIREBASE_SERVICE_ACCOUNT);
+
+    if (!admin.apps.length) {
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+    }
+
+    firestore = admin.firestore();
+    console.log("✅ Firestore initialized for Stripe premium updates.");
+  } catch (err) {
+    console.error("❌ Failed to parse FIREBASE_SERVICE_ACCOUNT JSON:", err);
+  }
+} else {
+  console.warn(
+    "⚠️ FIREBASE_SERVICE_ACCOUNT not set. Stripe webhook will NOT update premium flags."
+  );
+}
+
+// ------------------------------
+// GEMINI CONFIG
+// ------------------------------
+const MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+// ------------------------------
+// EXPRESS APP
+// ------------------------------
 const app = express();
-app.use(cors());
 
-// Stripe raw body required for webhook validation
+// CORS
 app.use(
-  express.json({
-    verify: (req, res, buf) => {
-      req.rawBody = buf;
-    },
+  cors({
+    origin: "*", // you can lock this down later
   })
 );
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-
-// ==============================
-// ===== FIREBASE ADMIN INIT ====
-// ==============================
-
-initializeApp({
-  credential: cert({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-  }),
-});
-
-const db = getFirestore();
-
-
-// ==============================================================
-// ============ HEALTH CHECK ENDPOINT ===========================
-// ==============================================================
-
-app.get("/", (req, res) => {
-  res.send("RefundHunter Backend Running ✔");
-});
-
-
-// ==============================================================
-// ============ CSV PARSE & CLAIM VALIDATION ====================
-// ==============================================================
-
-app.post("/audit", async (req, res) => {
-  try {
-    const { csvText, userId, appId } = req.body;
-
-    if (!csvText || !userId || !appId) {
-      return res.status(400).json({ error: "Missing required parameters." });
-    }
-
-    // Parse CSV → Convert to JSON
-    const parsed = await parseCSV(csvText);
-
-    // Validate claims
-    const claims = validateClaims(parsed);
-
-    // Store audit entry
-    const docRef = db
-      .collection(`artifacts/${appId}/users/${userId}/audits`)
-      .doc();
-
-    await docRef.set({
-      createdAt: Date.now(),
-      results: claims,
-      rawCount: parsed.length,
-    });
-
-    return res.json({ claims });
-  } catch (error) {
-    console.error("Audit error:", error);
-    return res.status(500).json({ error: "Audit failed." });
+// Body parser: skip JSON parsing for Stripe webhook
+app.use((req, res, next) => {
+  if (req.originalUrl === "/api/stripe-webhook") {
+    next();
+  } else {
+    express.json({ limit: "20mb" })(req, res, next);
   }
 });
 
+// ------------------------------
+// HEALTH CHECK
+// ------------------------------
+app.get("/", (req, res) => {
+  res.json({ status: "FBA Money Scout backend running" });
+});
 
-// ==============================================================
-// ============ STRIPE CHECKOUT SESSION =========================
-// ==============================================================
-
-app.post("/create-checkout-session", async (req, res) => {
+// ------------------------------
+// MAIN AUDIT ENDPOINT
+// ------------------------------
+app.post("/api/audit", async (req, res) => {
   try {
-    const { userId, appId } = req.body;
+    const { csvContent, fileName, userId } = req.body;
 
-    if (!userId || !appId) {
-      return res.status(400).json({ error: "Missing userId or appId" });
+    if (!csvContent) {
+      return res.status(400).json({ error: "Missing CSV content." });
     }
 
-    const YOUR_DOMAIN = "https://www.fbamoneyscout.com";
+    // PREPROCESS CSV BEFORE SENDING TO GEMINI
+    const { rows } = preprocessCSV(csvContent);
+
+    const prompt = `
+You are an Amazon FBA Reimbursement Auditor.
+
+Analyze ONLY the structured rows below.
+Do NOT rely on raw CSV formatting, only on the fields provided.
+
+Input rows:
+${JSON.stringify(rows, null, 2)}
+
+Rules:
+• A valid claim must include: sku, reason, quantity, estimatedValue.
+• estimatedValue = quantity * 8.50
+• Return ONLY pure JSON array like:
+
+[
+  {
+    "sku": "ABC-123",
+    "claimReason": "Warehouse Lost",
+    "quantity": 2,
+    "estimatedValue": 17.00,
+    "amazonTransactionId": "T123"
+  }
+]
+
+If no valid claims exist, return [].
+No comments. No markdown. No text outside JSON.
+`;
+
+    const payload = {
+      contents: [
+        {
+          parts: [{ text: prompt }],
+        },
+      ],
+    };
+
+    const gemResponse = await fetch(MODEL_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const gemData = await gemResponse.json();
+
+    if (!gemResponse.ok) {
+      console.error("Gemini API Error:", gemData);
+      return res.status(500).json({
+        error: "Gemini API error",
+        details: gemData,
+      });
+    }
+
+    const aiText =
+      gemData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+
+    let clean = aiText
+      .replace(/```json/gi, "")
+      .replace(/```/g, "")
+      .replace(/,\s*}/g, "}")
+      .replace(/,\s*]/g, "]");
+
+    let claims = [];
+    try {
+      claims = JSON.parse(clean);
+      claims = validateClaims(claims);
+    } catch (err) {
+      console.error("JSON PARSE FAIL:", clean);
+      return res.status(500).json({
+        error: "AI returned invalid JSON",
+        raw: clean,
+      });
+    }
+
+    const totalEstimatedValue = claims.reduce(
+      (sum, c) => sum + (parseFloat(c.estimatedValue) || 0),
+      0
+    );
+
+    // You could also generate pre-written messages here later
+    const messages = [];
+
+    return res.json({
+      claims,
+      totalEstimatedValue,
+      messages,
+    });
+  } catch (err) {
+    console.error("Server Error:", err);
+    return res.status(500).json({ error: "Server error", details: err });
+  }
+});
+
+// ------------------------------
+// STRIPE: CREATE CHECKOUT SESSION
+// ------------------------------
+app.post("/api/create-checkout-session", async (req, res) => {
+  try {
+    const { priceId, userId, email } = req.body;
+
+    if (!priceId || !userId) {
+      return res
+        .status(400)
+        .json({ error: "Missing priceId or userId in request body." });
+    }
 
     const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      payment_method_types: ["card"],
-
+      mode: "subscription", // or "payment" if using one-time
       line_items: [
         {
-          price_data: {
-            currency: "usd",
-            product_data: {
-              name: "FBA Money Scout – Premium Upgrade",
-            },
-            unit_amount: 1499, // $14.99
-          },
+          price: priceId,
           quantity: 1,
         },
       ],
-
-      success_url: `${YOUR_DOMAIN}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${YOUR_DOMAIN}/pricing`,
-
+      customer_email: email || undefined,
+      success_url: `${FRONTEND_URL}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${FRONTEND_URL}?canceled=1`,
       metadata: {
-        userId,
-        appId,
+        firebaseUserId: userId,
       },
     });
 
     return res.json({ url: session.url });
-  } catch (error) {
-    console.error("Stripe checkout session error:", error);
-    return res.status(500).json({ error: "Could not create checkout session" });
+  } catch (err) {
+    console.error("Stripe create-checkout-session error:", err);
+    return res
+      .status(500)
+      .json({ error: "Stripe error", details: err.message });
   }
 });
 
-
-// ==============================================================
-// ===================== STRIPE WEBHOOK =========================
-// ==============================================================
-
+// ------------------------------
+// STRIPE WEBHOOK
+// ------------------------------
 app.post(
-  "/stripe-webhook",
-  express.raw({ type: "application/json" }), // required
+  "/api/stripe-webhook",
+  express.raw({ type: "application/json" }),
   async (req, res) => {
-    const sig = req.headers["stripe-signature"];
     let event;
+
+    const sig = req.headers["stripe-signature"];
 
     try {
       event = stripe.webhooks.constructEvent(
-        req.rawBody,
+        req.body,
         sig,
-        process.env.STRIPE_WEBHOOK_SECRET
+        STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
-      console.error("Webhook signature verification failed:", err.message);
+      console.error("❌ Webhook signature verification failed:", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // Successful payment
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-
-      const userId = session.metadata.userId;
-      const appId = session.metadata.appId;
-
-      if (userId && appId) {
-        console.log("Marking user as premium:", userId);
-
-        const limitsRef = db.doc(
-          `artifacts/${appId}/users/${userId}/user_data/limits`
-        );
-
-        await limitsRef.set(
-          {
-            isPremium: true,
-            upgradedAt: Date.now(),
-          },
-          { merge: true }
-        );
+    try {
+      switch (event.type) {
+        case "checkout.session.completed":
+        case "invoice.paid": {
+          const session = event.data.object;
+          const firebaseUserId = session.metadata?.firebaseUserId;
+          if (firebaseUserId && firestore) {
+            const limitsRef = firestore.doc(
+              `artifacts/default-app-id/users/${firebaseUserId}/user_data/limits`
+            );
+            await limitsRef.set({ isPremium: true }, { merge: true });
+            console.log("✅ Marked user as premium:", firebaseUserId);
+          } else if (!firestore) {
+            console.warn(
+              "⚠️ Webhook received but Firestore not initialized; cannot set premium."
+            );
+          }
+          break;
+        }
+        default:
+          console.log(`Unhandled Stripe event type: ${event.type}`);
       }
-    }
 
-    res.json({ received: true });
+      res.json({ received: true });
+    } catch (err) {
+      console.error("❌ Error handling webhook:", err);
+      res.status(500).send("Webhook handler error");
+    }
   }
 );
 
-
-// ==============================================================
-// =============== PORT / STARTUP ===============================
-// ==============================================================
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`🔥 RefundHunter backend running on port ${PORT}`);
-});
+// ------------------------------
+// START SERVER
+// ------------------------------
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () =>
+  console.log(`🚀 FBA Money Scout backend running on port ${PORT}`)
+);
