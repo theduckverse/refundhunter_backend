@@ -6,9 +6,10 @@
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {
+ "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.0",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "papaparse": "^5.4.1"
   }
 }
