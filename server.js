@@ -10,15 +10,18 @@ import { preprocessCSV } from "./utils/parseCSV.js";
 import { validateClaims } from "./utils/validateClaims.js";
 
 // ------------------------------
-// ENV CONFIG (Render Dashboard → Environment)
+// ENV CONFIG
 // ------------------------------
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-const FIREBASE_SERVICE_ACCOUNT = process.env.FIREBASE_SERVICE_ACCOUNT; // JSON string
-const FRONTEND_URL =
-  process.env.FRONTEND_URL ||
-  "https://theduckverse.github.io/RefundHunter/"; // change if you rename the GH page
+const {
+  GEMINI_API_KEY,
+  STRIPE_SECRET_KEY,
+  STRIPE_WEBHOOK_SECRET,
+  FIREBASE_SERVICE_ACCOUNT,
+  FRONTEND_URL = "https://theduckverse.github.io/RefundHunter/",
+} = process.env;
+
+// This is the appId / namespace we’ve been using in Firestore
+const APP_ID = "fbamoneyscout";
 
 if (!GEMINI_API_KEY) {
   console.warn("⚠️ Missing GEMINI_API_KEY env variable.");
@@ -30,14 +33,18 @@ if (!STRIPE_WEBHOOK_SECRET) {
   console.warn("⚠️ Missing STRIPE_WEBHOOK_SECRET env variable.");
 }
 
-const stripe = new Stripe(STRIPE_SECRET_KEY, {
+// ------------------------------
+// STRIPE CLIENT
+// ------------------------------
+const stripe = new Stripe(STRIPE_SECRET_KEY || "", {
   apiVersion: "2024-06-20",
 });
 
 // ------------------------------
-// FIREBASE ADMIN (for premium flag)
+// FIREBASE ADMIN (for premium flags & history)
 // ------------------------------
 let firestore = null;
+let FieldValue = null;
 
 if (FIREBASE_SERVICE_ACCOUNT) {
   try {
@@ -50,15 +57,27 @@ if (FIREBASE_SERVICE_ACCOUNT) {
     }
 
     firestore = admin.firestore();
-    console.log("✅ Firestore initialized for Stripe premium updates.");
+    FieldValue = admin.firestore.FieldValue;
+    console.log("✅ Firestore initialized for backend updates.");
   } catch (err) {
     console.error("❌ Failed to parse FIREBASE_SERVICE_ACCOUNT JSON:", err);
   }
 } else {
   console.warn(
-    "⚠️ FIREBASE_SERVICE_ACCOUNT not set. Stripe webhook will NOT update premium flags."
+    "⚠️ FIREBASE_SERVICE_ACCOUNT not set. Backend cannot write premium flags or audit history."
   );
 }
+
+// Convenience helpers for paths
+const userLimitsDoc = (userId) =>
+  firestore.doc(
+    `artifacts/${APP_ID}/users/${userId}/user_data/limits`
+  );
+
+const userHistoryCollection = (userId) =>
+  firestore.collection(
+    `artifacts/${APP_ID}/users/${userId}/audit_history`
+  );
 
 // ------------------------------
 // GEMINI CONFIG
@@ -70,27 +89,30 @@ const MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemin
 // ------------------------------
 const app = express();
 
-// CORS
+// CORS (you can tighten this later to your exact origin)
 app.use(
   cors({
-    origin: "*", // you can lock this down later
+    origin: "*",
   })
 );
 
-// Body parser: skip JSON parsing for Stripe webhook
+// Body parser: skip JSON parsing for Stripe webhook (Stripe needs raw body)
 app.use((req, res, next) => {
-  if (req.originalUrl === "/api/stripe-webhook") {
-    next();
-  } else {
-    express.json({ limit: "20mb" })(req, res, next);
+  if (req.originalUrl.startsWith("/api/stripe-webhook")) {
+    return next();
   }
+  return express.json({ limit: "20mb" })(req, res, next);
 });
 
 // ------------------------------
 // HEALTH CHECK
 // ------------------------------
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.json({ status: "FBA Money Scout backend running" });
+});
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
 });
 
 // ------------------------------
@@ -162,6 +184,7 @@ No comments. No markdown. No text outside JSON.
     const aiText =
       gemData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
 
+    // Clean up possible ```json wrappers / trailing commas
     let clean = aiText
       .replace(/```json/gi, "")
       .replace(/```/g, "")
@@ -185,8 +208,52 @@ No comments. No markdown. No text outside JSON.
       0
     );
 
-    // You could also generate pre-written messages here later
+    // Optional messages placeholder
     const messages = [];
+
+    // --------------------------
+    // FIRESTORE: auditsUsed + history
+    // --------------------------
+    if (firestore && userId) {
+      try {
+        // Increment auditsUsed in limits doc
+        const limitsRef = userLimitsDoc(userId);
+
+        await firestore.runTransaction(async (tx) => {
+          const snap = await tx.get(limitsRef);
+          const data = snap.exists ? snap.data() : {};
+
+          const maxFreeAudits = data.maxFreeAudits ?? 5; // default 5 free
+          const newCount = (data.auditsUsed ?? 0) + 1;
+
+          tx.set(
+            limitsRef,
+            {
+              auditsUsed: newCount,
+              maxFreeAudits,
+            },
+            { merge: true }
+          );
+        });
+
+        // Append a history record
+        const historyRef = userHistoryCollection(userId);
+        await historyRef.add({
+          createdAt: FieldValue.serverTimestamp(),
+          fileName: fileName || "Unknown.csv",
+          totalEstimatedValue,
+          totalClaims: claims.length,
+          sampleSku: claims[0]?.sku || null,
+          sampleReason: claims[0]?.claimReason || null,
+        });
+      } catch (err) {
+        console.error("⚠️ Failed to update Firestore for audit:", err);
+      }
+    } else if (!firestore && userId) {
+      console.warn(
+        "⚠️ Firestore not initialized; cannot track audits/history."
+      );
+    }
 
     return res.json({
       claims,
@@ -196,6 +263,65 @@ No comments. No markdown. No text outside JSON.
   } catch (err) {
     console.error("Server Error:", err);
     return res.status(500).json({ error: "Server error", details: err });
+  }
+});
+
+// ------------------------------
+// USER STATUS (for login gating + UI)
+// ------------------------------
+app.get("/api/user-status/:userId", async (req, res) => {
+  const { userId } = req.params;
+
+  if (!firestore) {
+    return res.status(500).json({ error: "Firestore not configured" });
+  }
+  if (!userId) {
+    return res.status(400).json({ error: "Missing userId" });
+  }
+
+  try {
+    const limitsSnap = await userLimitsDoc(userId).get();
+    const data = limitsSnap.exists ? limitsSnap.data() : {};
+
+    return res.json({
+      isPremium: !!data.isPremium,
+      auditsUsed: data.auditsUsed ?? 0,
+      maxFreeAudits: data.maxFreeAudits ?? 5,
+    });
+  } catch (err) {
+    console.error("Error fetching user status:", err);
+    return res.status(500).json({ error: "Failed to fetch user status" });
+  }
+});
+
+// ------------------------------
+// AUDIT HISTORY FETCH
+// ------------------------------
+app.get("/api/audit-history/:userId", async (req, res) => {
+  const { userId } = req.params;
+
+  if (!firestore) {
+    return res.status(500).json({ error: "Firestore not configured" });
+  }
+  if (!userId) {
+    return res.status(400).json({ error: "Missing userId" });
+  }
+
+  try {
+    const snap = await userHistoryCollection(userId)
+      .orderBy("createdAt", "desc")
+      .limit(20)
+      .get();
+
+    const history = snap.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
+
+    return res.json({ history });
+  } catch (err) {
+    console.error("Error fetching audit history:", err);
+    return res.status(500).json({ error: "Failed to fetch audit history" });
   }
 });
 
@@ -213,27 +339,25 @@ app.post("/api/create-checkout-session", async (req, res) => {
     }
 
     const session = await stripe.checkout.sessions.create({
-  mode: "subscription",
+      mode: "subscription",
+      payment_method_types: ["card", "link"], // Enable card + Link
 
-  payment_method_types: ["card", "link"],  // 🔥 THIS FIXES THE ISSUE
+      line_items: [
+        {
+          price: priceId,
+          quantity: 1,
+        },
+      ],
 
-  line_items: [
-    {
-      price: priceId,
-      quantity: 1,
-    },
-  ],
+      customer_email: email || undefined,
 
-  customer_email: email || undefined,
+      success_url: `${FRONTEND_URL}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${FRONTEND_URL}?canceled=1`,
 
-  success_url: `${FRONTEND_URL}?session_id={CHECKOUT_SESSION_ID}`,
-  cancel_url: `${FRONTEND_URL}?canceled=1`,
-
-  metadata: {
-    firebaseUserId: userId,
-  },
-});
-
+      metadata: {
+        firebaseUserId: userId,
+      },
+    });
 
     return res.json({ url: session.url });
   } catch (err) {
@@ -245,21 +369,8 @@ app.post("/api/create-checkout-session", async (req, res) => {
 });
 
 // ------------------------------
-// STRIPE WEBHOOK
+// STRIPE WEBHOOK (subscription lifecycle)
 // ------------------------------
-app.post(
-  "/api/stripe-webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    let event;
-
-    const sig = req.headers["stripe-signature"];
-
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-      // STRIPE WEBHOOK (Full Subscription Handling)
 app.post(
   "/api/stripe-webhook",
   express.raw({ type: "application/json" }),
@@ -278,17 +389,23 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    if (!firestore) {
+      console.warn(
+        "⚠️ Webhook received but Firestore not initialized; cannot update premium flags."
+      );
+    }
+
     try {
       switch (event.type) {
         case "checkout.session.completed": {
           const session = event.data.object;
           const firebaseUserId = session.metadata?.firebaseUserId;
 
-          if (firebaseUserId) {
-            await firestore
-              .doc(`artifacts/fbamoneyscout/users/${firebaseUserId}/user_data/limits`)
-              .set({ isPremium: true }, { merge: true });
-
+          if (firestore && firebaseUserId) {
+            await userLimitsDoc(firebaseUserId).set(
+              { isPremium: true },
+              { merge: true }
+            );
             console.log("✅ Premium enabled after checkout:", firebaseUserId);
           }
           break;
@@ -300,11 +417,11 @@ app.post(
           const subscription = event.data.object;
           const firebaseUserId = subscription.metadata?.firebaseUserId;
 
-          if (firebaseUserId) {
-            await firestore
-              .doc(`artifacts/fbamoneyscout/users/${firebaseUserId}/user_data/limits`)
-              .set({ isPremium: true }, { merge: true });
-
+          if (firestore && firebaseUserId) {
+            await userLimitsDoc(firebaseUserId).set(
+              { isPremium: true },
+              { merge: true }
+            );
             console.log("🔁 Subscription active/renewed:", firebaseUserId);
           }
           break;
@@ -315,25 +432,28 @@ app.post(
           const subscription = event.data.object;
           const firebaseUserId = subscription.metadata?.firebaseUserId;
 
-          if (firebaseUserId) {
-            await firestore
-              .doc(`artifacts/fbamoneyscout/users/${firebaseUserId}/user_data/limits`)
-              .set({ isPremium: false }, { merge: true });
-
+          if (firestore && firebaseUserId) {
+            await userLimitsDoc(firebaseUserId).set(
+              { isPremium: false },
+              { merge: true }
+            );
             console.log("⚠️ Subscription canceled or past due:", firebaseUserId);
           }
           break;
         }
 
         default:
-          console.log("ℹ️ Unhandled event:", event.type);
+          console.log("ℹ️ Unhandled Stripe event type:", event.type);
       }
-    res.json({ received: true });
-  } catch (err) {
-    console.error("❌ Error handling webhook:", err);
-    return res.status(500).send("Webhook handler error");
+
+      res.json({ received: true });
+    } catch (err) {
+      console.error("❌ Error handling webhook:", err);
+      res.status(500).send("Webhook handler error");
+    }
   }
-});
+);
+
 // ------------------------------
 // START SERVER
 // ------------------------------
@@ -342,7 +462,3 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 FBA Money Scout backend running on port ${PORT}`);
 });
-
-
-
-
