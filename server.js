@@ -1,226 +1,210 @@
-// RefundHunter Backend API (Gemini 2.0 Compliant)
-
+// ==============================
+// ========== IMPORTS ===========
+// ==============================
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch";
-import { preprocessCSV } from "./utils/parseCSV.js";
-import { validateClaims } from "./utils/validateClaims.js";
+import Stripe from "stripe";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+
+import {
+  initializeApp,
+  cert
+} from "firebase-admin/app";
+
+import {
+  getFirestore,
+  FieldValue,
+} from "firebase-admin/firestore";
+
+import parseCSV from "./utils/parseCSV.js";
+import validateClaims from "./utils/validateClaims.js";
+
+// ==============================
+// ========== CONSTANTS =========
+// ==============================
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "20mb" }));
 
-// ------------------------------
-// CONFIG
-// ------------------------------
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+// Stripe raw body required for webhook validation
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
-// ------------------------------
-// HEALTH CHECK
-// ------------------------------
-app.get("/", (req, res) => {
-  res.json({ status: "RefundHunter backend running" });
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// ==============================
+// ===== FIREBASE ADMIN INIT ====
+// ==============================
+
+initializeApp({
+  credential: cert({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  }),
 });
 
-// ------------------------------
-// MAIN AUDIT ENDPOINT
-// ------------------------------
-app.post("/api/audit", async (req, res) => {
+const db = getFirestore();
+
+
+// ==============================================================
+// ============ HEALTH CHECK ENDPOINT ===========================
+// ==============================================================
+
+app.get("/", (req, res) => {
+  res.send("RefundHunter Backend Running ✔");
+});
+
+
+// ==============================================================
+// ============ CSV PARSE & CLAIM VALIDATION ====================
+// ==============================================================
+
+app.post("/audit", async (req, res) => {
   try {
-const { csvContent, fileName, userId } = req.body;
+    const { csvText, userId, appId } = req.body;
 
-if (!userId || userId === "anonymous") {
-    return res.status(403).json({ error: "User not authenticated." });
-}
-
-    // ------------------------------
-    // PREPROCESS CSV BEFORE SENDING TO GEMINI
-    // ------------------------------
-    const { rows } = preprocessCSV(csvContent);
-    console.log("PARSED CSV ROWS:", rows);
-
-    // ------------------------------
-    // REIMBURSEMENT + MESSAGE PROMPT
-    // ------------------------------
-    const prompt = `
-You are an expert Amazon FBA reimbursement auditor.
-
-You will receive a list of inventory ledger rows as JSON.
-Each row can include fields like:
-- sku
-- transaction-type
-- quantity
-- reference-id
-- event-date
-- fulfillment-center
-- disposition
-- researching
-- location
-- reason
-- unit-cost
-
-Your job is:
-
-1) Identify inventory issues that should be filed as FBA reimbursement claims.
-2) For each claim, calculate:
-   - sku
-   - claimReason (short text like "Lost inventory" or "Warehouse damaged")
-   - quantity (positive integer units to claim)
-   - estimatedValue (quantity * 8.50 in USD, numeric)
-   - amazonTransactionId (if you can infer one from the data, else "N/A")
-
-3) Generate ready-to-send Amazon case messages for the seller to copy/paste.
-   Each message should:
-   - Be written in polite professional English.
-   - Reference the sku, quantity, and situation.
-   - Clearly request investigation and reimbursement.
-
-IMPORTANT RULES:
-- Only create claims where there is a clear issue (missing, lost, damaged, destroyed, etc).
-- estimatedValue MUST be numeric, not a string, and equal to quantity * 8.50.
-- If no valid claims exist, return empty arrays.
-
-Return PURE JSON ONLY with THIS EXACT STRUCTURE:
-
-{
-  "claims": [
-    {
-      "sku": "TEST-SKU-001",
-      "claimReason": "Lost inventory",
-      "quantity": 2,
-      "estimatedValue": 17.0,
-      "amazonTransactionId": "123-456" 
+    if (!csvText || !userId || !appId) {
+      return res.status(400).json({ error: "Missing required parameters." });
     }
-  ],
-  "messages": [
-    {
-      "sku": "TEST-SKU-001",
-      "reason": "Lost inventory",
-      "message": "Hello Amazon Support, ... full case message text ..."
-    }
-  ]
-}
 
-- Do NOT wrap in markdown.
-- Do NOT add explanations.
-- ONLY return this JSON object.
+    // Parse CSV → Convert to JSON
+    const parsed = await parseCSV(csvText);
 
-InputRows:
-${JSON.stringify(rows, null, 2)}
-`;
+    // Validate claims
+    const claims = validateClaims(parsed);
 
-    // ------------------------------
-    // GEMINI PAYLOAD
-    // ------------------------------
-    const payload = {
-      contents: [
-        {
-          parts: [{ text: prompt }]
-        }
-      ]
-    };
+    // Store audit entry
+    const docRef = db
+      .collection(`artifacts/${appId}/users/${userId}/audits`)
+      .doc();
 
-    // ------------------------------
-    // CALL GEMINI
-    // ------------------------------
-    const gemResponse = await fetch(MODEL_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+    await docRef.set({
+      createdAt: Date.now(),
+      results: claims,
+      rawCount: parsed.length,
     });
 
-    const gemData = await gemResponse.json();
-
-    if (!gemResponse.ok) {
-      console.error("Gemini API Error:", gemData);
-      return res.status(500).json({
-        error: "Gemini API error",
-        details: gemData
-      });
-    }
-
-    // Extract text response
-    const aiText =
-      gemData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-
-    // ------------------------------
-    // FORCE-REPAIR JSON (strip fences / trailing commas)
-    // ------------------------------
-    let clean = aiText
-      .replace(/```json/gi, "")
-      .replace(/```/g, "")
-      .replace(/,\s*}/g, "}")
-      .replace(/,\s*]/g, "]");
-
-    console.log("RAW AI TEXT:", aiText);
-    console.log("CLEANED AI TEXT:", clean);
-
-    // ------------------------------
-    // PARSE JSON FROM AI
-    // ------------------------------
-    let parsed;
-    try {
-      parsed = JSON.parse(clean);
-    } catch (err) {
-      console.error("JSON PARSE FAIL:", clean);
-      return res.status(500).json({
-        error: "AI returned invalid JSON",
-        raw: clean
-      });
-    }
-
-    // Support both new structure {claims, messages} and legacy [claims]
-    const rawClaims = Array.isArray(parsed)
-      ? parsed
-      : Array.isArray(parsed.claims)
-      ? parsed.claims
-      : [];
-
-    let claims = validateClaims(rawClaims);
-
-    // Normalize messages
-    let messages = [];
-    if (parsed && Array.isArray(parsed.messages)) {
-      messages = parsed.messages
-        .map((m) => ({
-          sku: (m.sku || "").trim(),
-          reason: (m.reason || "").trim(),
-          message: (m.message || "").trim()
-        }))
-        .filter((m) => m.message.length > 0);
-    }
-
-    console.log("FINAL CLAIMS:", claims);
-    console.log("FINAL MESSAGES:", messages);
-
-    // ------------------------------
-    // CALCULATE TOTAL
-    // ------------------------------
-    const totalEstimatedValue = claims.reduce(
-      (sum, c) => sum + (parseFloat(c.estimatedValue) || 0),
-      0
-    );
-
-    // ------------------------------
-    // SEND BACK TO FRONTEND
-    // ------------------------------
-    return res.json({
-      claims,
-      totalEstimatedValue,
-      messages
-    });
-  } catch (err) {
-    console.error("Server Error:", err);
-    return res.status(500).json({ error: "Server error", details: err.message || err });
+    return res.json({ claims });
+  } catch (error) {
+    console.error("Audit error:", error);
+    return res.status(500).json({ error: "Audit failed." });
   }
 });
 
-// ------------------------------
-// START SERVER
-// ------------------------------
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () =>
-  console.log(`RefundHunter backend running on port ${PORT}`)
+
+// ==============================================================
+// ============ STRIPE CHECKOUT SESSION =========================
+// ==============================================================
+
+app.post("/create-checkout-session", async (req, res) => {
+  try {
+    const { userId, appId } = req.body;
+
+    if (!userId || !appId) {
+      return res.status(400).json({ error: "Missing userId or appId" });
+    }
+
+    const YOUR_DOMAIN = "https://www.fbamoneyscout.com";
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: "FBA Money Scout – Premium Upgrade",
+            },
+            unit_amount: 1499, // $14.99
+          },
+          quantity: 1,
+        },
+      ],
+
+      success_url: `${YOUR_DOMAIN}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${YOUR_DOMAIN}/pricing`,
+
+      metadata: {
+        userId,
+        appId,
+      },
+    });
+
+    return res.json({ url: session.url });
+  } catch (error) {
+    console.error("Stripe checkout session error:", error);
+    return res.status(500).json({ error: "Could not create checkout session" });
+  }
+});
+
+
+// ==============================================================
+// ===================== STRIPE WEBHOOK =========================
+// ==============================================================
+
+app.post(
+  "/stripe-webhook",
+  express.raw({ type: "application/json" }), // required
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.rawBody,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("Webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Successful payment
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+
+      const userId = session.metadata.userId;
+      const appId = session.metadata.appId;
+
+      if (userId && appId) {
+        console.log("Marking user as premium:", userId);
+
+        const limitsRef = db.doc(
+          `artifacts/${appId}/users/${userId}/user_data/limits`
+        );
+
+        await limitsRef.set(
+          {
+            isPremium: true,
+            upgradedAt: Date.now(),
+          },
+          { merge: true }
+        );
+      }
+    }
+
+    res.json({ received: true });
+  }
 );
 
+
+// ==============================================================
+// =============== PORT / STARTUP ===============================
+// ==============================================================
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`🔥 RefundHunter backend running on port ${PORT}`);
+});
