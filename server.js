@@ -259,6 +259,18 @@ app.post(
       event = stripe.webhooks.constructEvent(
         req.body,
         sig,
+      // STRIPE WEBHOOK (Full Subscription Handling)
+app.post(
+  "/api/stripe-webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    let event;
+    const sig = req.headers["stripe-signature"];
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
         STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
@@ -268,25 +280,53 @@ app.post(
 
     try {
       switch (event.type) {
-        case "checkout.session.completed":
-        case "invoice.paid": {
+        case "checkout.session.completed": {
           const session = event.data.object;
           const firebaseUserId = session.metadata?.firebaseUserId;
-          if (firebaseUserId && firestore) {
-            const limitsRef = firestore.doc(
-              `artifacts/default-app-id/users/${firebaseUserId}/user_data/limits`
-            );
-            await limitsRef.set({ isPremium: true }, { merge: true });
-            console.log("✅ Marked user as premium:", firebaseUserId);
-          } else if (!firestore) {
-            console.warn(
-              "⚠️ Webhook received but Firestore not initialized; cannot set premium."
-            );
+
+          if (firebaseUserId) {
+            await firestore
+              .doc(`artifacts/fbamoneyscout/users/${firebaseUserId}/user_data/limits`)
+              .set({ isPremium: true }, { merge: true });
+
+            console.log("✅ Premium enabled after checkout:", firebaseUserId);
           }
           break;
         }
+
+        case "customer.subscription.created":
+        case "customer.subscription.updated":
+        case "invoice.paid": {
+          const subscription = event.data.object;
+          const firebaseUserId = subscription.metadata?.firebaseUserId;
+
+          if (firebaseUserId) {
+            await firestore
+              .doc(`artifacts/fbamoneyscout/users/${firebaseUserId}/user_data/limits`)
+              .set({ isPremium: true }, { merge: true });
+
+            console.log("🔁 Subscription active/renewed:", firebaseUserId);
+          }
+          break;
+        }
+
+        case "customer.subscription.deleted":
+        case "invoice.payment_failed": {
+          const subscription = event.data.object;
+          const firebaseUserId = subscription.metadata?.firebaseUserId;
+
+          if (firebaseUserId) {
+            await firestore
+              .doc(`artifacts/fbamoneyscout/users/${firebaseUserId}/user_data/limits`)
+              .set({ isPremium: false }, { merge: true });
+
+            console.log("⚠️ Subscription canceled or past due:", firebaseUserId);
+          }
+          break;
+        }
+
         default:
-          console.log(`Unhandled Stripe event type: ${event.type}`);
+          console.log("ℹ️ Unhandled event:", event.type);
       }
 
       res.json({ received: true });
@@ -297,6 +337,7 @@ app.post(
   }
 );
 
+
 // ------------------------------
 // START SERVER
 // ------------------------------
@@ -304,4 +345,5 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () =>
   console.log(`🚀 FBA Money Scout backend running on port ${PORT}`)
 );
+
 
