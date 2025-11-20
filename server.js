@@ -26,7 +26,47 @@ app.use(cors());
 const JSON_SIZE_LIMIT_MB = 25;
 const UPLOAD_SIZE_LIMIT_MB = 100;
 const MAX_CLAIMS = 50;
+// ----------------------
+// CREATE STRIPE CHECKOUT SESSION
+// ----------------------
+app.get("/create-checkout-session", async (req, res) => {
+  try {
+    const plan = req.query.plan;
+    const uid = req.query.client_reference_id;
 
+    if (!plan || !uid) {
+      return res.status(400).json({ error: "Missing plan or client_reference_id" });
+    }
+
+    // Map plan → Stripe Price ID
+    let priceId = null;
+
+    if (plan === "audit_single") {
+      priceId = process.env.STRIPE_PRICE_SINGLE;   // $99 one-time
+    }
+
+    if (plan === "audit_monthly") {
+      priceId = process.env.STRIPE_PRICE_MONTHLY; // $199 subscription
+    }
+
+    if (!priceId) {
+      return res.status(400).json({ error: "Invalid plan" });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: plan === "audit_single" ? "payment" : "subscription",
+      line_items: [{ price: priceId, quantity: 1 }],
+      client_reference_id: uid, // Pass Firebase UID to webhook
+      success_url: "https://theduckverse.github.io/RefundHunter/success.html",
+      cancel_url: "https://theduckverse.github.io/RefundHunter/cancel.html",
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error("Checkout session error:", err);
+    res.status(500).json({ error: "Failed to create checkout session" });
+  }
+});
 // ----------------------
 // STRIPE WEBHOOK (RAW BODY)
 // ----------------------
@@ -206,3 +246,4 @@ app.get("/", (req, res) => {
 // ----------------------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🔥 Server running on port ${PORT}`));
+
