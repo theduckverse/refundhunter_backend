@@ -26,6 +26,56 @@ const MAX_CLAIMS = 50;           // Cap #claims so UI isn't flooded
 
 // Express middlewares
 app.use(cors());
+// --- STRIPE WEBHOOK (must use raw body) ---
+const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+// Stripe sends events here
+app.post(
+  "/stripe-webhook",
+  bodyParser.raw({ type: "application/json" }),
+  (req, res) => {
+    const sig = req.headers["stripe-signature"];
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    } catch (err) {
+      console.error("⚠️  Webhook signature verification failed.", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // ✅ Handle different event types
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object;
+
+        // This is where we decide the plan
+        // You can use:
+        // - session.metadata.plan_type
+        // - session.amount_total
+        // - session.mode / line_items
+        //
+        // For now we just log it so we know it's working.
+        console.log("✅ Checkout completed:", {
+          id: session.id,
+          customer_email: session.customer_details?.email,
+          amount_total: session.amount_total,
+          metadata: session.metadata
+        });
+
+        // TODO (next step): look up Firebase user by email or metadata,
+        // then mark them as premium / add single-audit credit.
+        break;
+      }
+
+      default:
+        console.log(`Unhandled Stripe event type: ${event.type}`);
+    }
+
+    // Must respond 2xx so Stripe knows we received it
+    res.json({ received: true });
+  }
+);
 app.use(express.json({ limit: `${JSON_SIZE_LIMIT_MB}mb` }));
 
 // Multer for streaming uploads (file is written to /tmp and streamed from disk)
@@ -393,3 +443,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`RefundHunter backend listening on port ${PORT}`);
 });
+
