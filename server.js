@@ -19,14 +19,6 @@ if (!admin.apps.length) {
 
 const app = express();
 app.use(cors());
-
-// ----------------------
-// CONFIG
-// ----------------------
-const JSON_SIZE_LIMIT_MB = 25;
-const UPLOAD_SIZE_LIMIT_MB = 100;
-const MAX_CLAIMS = 50;
-// ----------------------
 // CREATE STRIPE CHECKOUT SESSION
 // ----------------------
 app.get("/create-checkout-session", async (req, res) => {
@@ -60,7 +52,12 @@ app.get("/create-checkout-session", async (req, res) => {
       success_url: "https://theduckverse.github.io/RefundHunter/success.html",
       cancel_url: "https://theduckverse.github.io/RefundHunter/cancel.html",
     });
-
+// ----------------------
+// CONFIG
+// ----------------------
+const JSON_SIZE_LIMIT_MB = 25;
+const UPLOAD_SIZE_LIMIT_MB = 100;
+const MAX_CLAIMS = 50;
     res.json({ url: session.url });
   } catch (err) {
     console.error("Checkout session error:", err);
@@ -246,4 +243,5 @@ app.get("/", (req, res) => {
 // ----------------------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🔥 Server running on port ${PORT}`));
+
 
