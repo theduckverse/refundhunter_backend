@@ -1,16 +1,16 @@
 {
-  "name": "refundhunter-backend",
+  "name": "refundhunter_backend",
   "version": "1.0.0",
-  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
+    "csv-parse": "^5.5.5",
+    "csv-parser": "^3.0.0",
     "express": "^4.19.2",
-    "node-fetch": "^3.3.2",
-    "stripe": "^15.11.0",
-    "firebase-admin": "^12.3.0"
+    "multer": "^1.4.5-lts.1",
+    "node-fetch": "^2.6.7"
   }
 }
