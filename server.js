@@ -1,599 +1,395 @@
-// server.js (Node 18+, "type": "module" in package.json)
+// server.js
+//
+// FBA Money Scout backend
+// - POST /api/audit       : JSON body { csvContent, fileName, userId }  (works with your current frontend)
+// - POST /api/audit-upload: multipart/form-data with a CSV file (for future, true streaming)
+//
+// Uses heuristic CSV parsing to generate claims + messages.
+// If OPENAI_API_KEY is set, it also asks OpenAI once for a short summary.
+//
 
-import express from "express";
-import cors from "cors";
-import fetch from "node-fetch";
-import Stripe from "stripe";
-import admin from "firebase-admin";
+const express = require("express");
+const cors = require("cors");
+const { parse } = require("csv-parse/sync");
+const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
+const csvStreamParser = require("csv-parser");
+const fetch = require("node-fetch");
 
-// ------------------------------
-// ENV CONFIG
-// ------------------------------
-const {
-  GEMINI_API_KEY,
-  STRIPE_SECRET_KEY,
-  STRIPE_WEBHOOK_SECRET,
-  FIREBASE_SERVICE_ACCOUNT,
-  FRONTEND_URL = "https://theduckverse.github.io/RefundHunter/",
-} = process.env;
-
-// This is the appId / namespace we’ve been using in Firestore
-const APP_ID = "fbamoneyscout";
-
-if (!GEMINI_API_KEY) {
-  console.warn("⚠️ Missing GEMINI_API_KEY env variable.");
-}
-if (!STRIPE_SECRET_KEY) {
-  console.warn("⚠️ Missing STRIPE_SECRET_KEY env variable.");
-}
-if (!STRIPE_WEBHOOK_SECRET) {
-  console.warn("⚠️ Missing STRIPE_WEBHOOK_SECRET env variable.");
-}
-
-// ------------------------------
-// STRIPE CLIENT
-// ------------------------------
-const stripe = new Stripe(STRIPE_SECRET_KEY || "", {
-  apiVersion: "2024-06-20",
-});
-
-// ------------------------------
-// FIREBASE ADMIN (for premium flags & history)
-// ------------------------------
-let firestore = null;
-let FieldValue = null;
-
-if (FIREBASE_SERVICE_ACCOUNT) {
-  try {
-    const serviceAccount = JSON.parse(FIREBASE_SERVICE_ACCOUNT);
-
-    if (!admin.apps.length) {
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-      });
-    }
-
-    firestore = admin.firestore();
-    FieldValue = admin.firestore.FieldValue;
-    console.log("✅ Firestore initialized for backend updates.");
-  } catch (err) {
-    console.error("❌ Failed to parse FIREBASE_SERVICE_ACCOUNT JSON:", err);
-  }
-} else {
-  console.warn(
-    "⚠️ FIREBASE_SERVICE_ACCOUNT not set. Backend cannot write premium flags or audit history."
-  );
-}
-
-// Convenience helpers for paths
-const userLimitsDoc = (userId) =>
-  firestore.doc(
-    `artifacts/${APP_ID}/users/${userId}/user_data/limits`
-  );
-
-const userHistoryCollection = (userId) =>
-  firestore.collection(
-    `artifacts/${APP_ID}/users/${userId}/audit_history`
-  );
-
-// ------------------------------
-// UTILITY FUNCTIONS (Integrated from utils/parseCSV.js and utils/validateClaims.js)
-// ------------------------------
-
-// Define the critical headers we expect and their aliases in the output data
-const KEY_HEADERS = {
-    'sku': 'sku',
-    'product-sku': 'sku',
-    'transaction-type': 'claimReason', // Used for the AI to determine claim eligibility
-    'event-type': 'claimReason',
-    'quantity': 'quantity',
-    'shipped-quantity': 'quantity',
-    'reference-id': 'amazonTransactionId', // Unique ID for tracking
-    'transaction-item-id': 'amazonTransactionId',
-};
-
-/**
- * Preprocesses the raw CSV content into a structured array of objects.
- * It focuses on extracting the required fields for the audit logic.
- *
- * @param {string} csvContent The raw CSV file content.
- * @returns {{rows: Array<Object>}} An object containing the structured rows.
- */
-function preprocessCSV(csvContent) {
-    if (!csvContent) {
-        return { rows: [] };
-    }
-
-    const lines = csvContent.trim().split('\n');
-    if (lines.length === 0) {
-        return { rows: [] };
-    }
-
-    // A simple way to handle common delimiters (comma or tab)
-    const delimiter = csvContent.includes('\t') ? '\t' : ',';
-
-    // 1. Parse Header
-    let headers = lines[0].toLowerCase().split(delimiter).map(h => h.trim().replace(/"/g, ''));
-    
-    // Create a map from the current CSV header to the required output key (e.g., {'product-sku': 'sku'})
-    const headerMap = {};
-    headers.forEach((header, index) => {
-        // Find a matching key in the KEY_HEADERS map
-        const requiredKey = Object.keys(KEY_HEADERS).find(key => header.includes(key));
-        if (requiredKey) {
-            headerMap[index] = KEY_HEADERS[requiredKey];
-        }
-    });
-
-    const rows = [];
-
-    // 2. Parse Rows (skipping header row)
-    for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
-
-        // Split line by delimiter, cleaning up quotes
-        const values = line.split(delimiter).map(v => v.trim().replace(/"/g, ''));
-        const rowData = {};
-        
-        // Map values to the standardized keys
-        Object.keys(headerMap).forEach(index => {
-            const key = headerMap[index];
-            rowData[key] = values[index];
-        });
-
-        // Only include rows that have at least SKU and Quantity defined
-        if (rowData.sku && parseInt(rowData.quantity, 10) > 0) {
-            rows.push(rowData);
-        }
-    }
-
-    // Limit the number of rows sent to Gemini to prevent excessively large requests
-    return { rows: rows.slice(0, 500) };
-}
-
-/**
- * Validates and cleans the claims array returned by the AI.
- * It filters out malformed or invalid entries.
- *
- * @param {Array<Object>} claims The array of claim objects from the AI response.
- * @returns {Array<Object>} The array of valid, sanitized claims.
- */
-function validateClaims(claims) {
-    if (!Array.isArray(claims)) {
-        console.error("Validation Error: Input is not an array.");
-        return [];
-    }
-
-    const validClaims = [];
-
-    for (const claim of claims) {
-        // Ensure the claim is an object
-        if (typeof claim !== 'object' || claim === null) {
-            continue;
-        }
-
-        // Required fields check
-        const requiredFields = ['sku', 'claimReason', 'quantity', 'estimatedValue'];
-        const missingField = requiredFields.some(field => !claim[field]);
-
-        if (missingField) {
-            console.warn("Claim dropped due to missing required field:", claim);
-            continue;
-        }
-
-        // Data type sanitization
-        const quantity = parseInt(claim.quantity, 10);
-        const estimatedValue = parseFloat(claim.estimatedValue);
-
-        // Value checks
-        if (isNaN(quantity) || quantity <= 0) {
-            console.warn("Claim dropped: Invalid quantity.", claim);
-            continue;
-        }
-        if (isNaN(estimatedValue) || estimatedValue <= 0) {
-            console.warn("Claim dropped: Invalid estimated value.", claim);
-            continue;
-        }
-
-        // Final structure for a valid claim
-        const sanitizedClaim = {
-            sku: String(claim.sku).trim(),
-            claimReason: String(claim.claimReason).trim(),
-            quantity: quantity,
-            estimatedValue: parseFloat(estimatedValue.toFixed(2)), // Ensure 2 decimal places
-            amazonTransactionId: claim.amazonTransactionId ? String(claim.amazonTransactionId).trim() : null,
-        };
-
-        validClaims.push(sanitizedClaim);
-    }
-
-    return validClaims;
-}
-
-
-// ------------------------------
-// GEMINI CONFIG
-// ------------------------------
-const MODEL_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-
-// ------------------------------
-// EXPRESS APP
-// ------------------------------
 const app = express();
 
-// CORS (you can tighten this later to your exact origin)
-app.use(
-  cors({
-    origin: "*",
-  })
-);
+// ----------- CONFIG ----------
+const JSON_SIZE_LIMIT_MB = 25;   // Max JSON csvContent size
+const UPLOAD_SIZE_LIMIT_MB = 100; // Max uploaded file size
+const MAX_CLAIMS = 50;           // Cap #claims so UI isn't flooded
 
-// Body parser: skip JSON parsing for Stripe webhook (Stripe needs raw body)
-app.use((req, res, next) => {
-  if (req.originalUrl.startsWith("/api/stripe-webhook")) {
-    return next();
-  }
-  return express.json({ limit: "20mb" })(req, res, next);
+// Express middlewares
+app.use(cors());
+app.use(express.json({ limit: `${JSON_SIZE_LIMIT_MB}mb` }));
+
+// Multer for streaming uploads (file is written to /tmp and streamed from disk)
+const upload = multer({
+  dest: "/tmp/uploads",
+  limits: {
+    fileSize: UPLOAD_SIZE_LIMIT_MB * 1024 * 1024
+  }
 });
 
-// ------------------------------
-// HEALTH CHECK
-// ------------------------------
-app.get("/", (_req, res) => {
-  res.json({ status: "FBA Money Scout backend running" });
-});
+// ---------- UTILITIES ----------
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
-});
+function findFieldName(record, candidates) {
+  const keys = Object.keys(record || {});
+  const lowered = keys.map((k) => k.toLowerCase());
+  for (const cand of candidates) {
+    const idx = lowered.findIndex((k) => k.includes(cand));
+    if (idx !== -1) return keys[idx];
+  }
+  return null;
+}
 
-// ------------------------------
-// MAIN AUDIT ENDPOINT
-// ------------------------------
-app.post("/api/audit", async (req, res) => {
-  try {
-    const { csvContent, fileName, userId } = req.body;
+function buildClaimsFromRecords(records) {
+  if (!records || records.length === 0) {
+    return { claims: [], totalEstimatedValue: 0, messages: [] };
+  }
 
-    if (!csvContent) {
-      return res.status(400).json({ error: "Missing CSV content." });
-    }
+  const sample = records[0];
 
-    // PREPROCESS CSV BEFORE SENDING TO GEMINI
-    // Calls the locally defined function
-    const { rows } = preprocessCSV(csvContent);
+  const skuField =
+    findFieldName(sample, ["seller-sku", "msku", "sku"]) || null;
+  const qtyField =
+    findFieldName(sample, ["quantity", "qty", "units", "change"]) || null;
+  const valueField = findFieldName(sample, [
+    "amount",
+    "value",
+    "reimbursement",
+    "estimated",
+    "unit-price",
+    "price"
+  ]);
+  const reasonField = findFieldName(sample, [
+    "reason",
+    "event",
+    "event-type",
+    "disposition"
+  ]);
+  const txnField = findFieldName(sample, [
+    "transaction-id",
+    "event-id",
+    "reference",
+    "id"
+  ]);
 
-    const prompt = `
-You are an Amazon FBA Reimbursement Auditor.
+  let claims = [];
+  let messages = [];
+  let totalEstimatedValue = 0;
 
-Analyze ONLY the structured rows below.
-Do NOT rely on raw CSV formatting, only on the fields provided.
+  for (let i = 0; i < records.length && claims.length < MAX_CLAIMS; i++) {
+    const row = records[i];
 
-Input rows:
-${JSON.stringify(rows, null, 2)}
+    const sku = skuField ? String(row[skuField] || "").trim() : "";
+    const rawQty = qtyField ? row[qtyField] : 1;
+    const quantity = Number(rawQty) || 1;
 
-Rules:
-• A valid claim must include: sku, reason, quantity, estimatedValue.
-• estimatedValue = quantity * 8.50
-• Return ONLY pure JSON array like:
+    let value = 0;
+    if (valueField && row[valueField] != null) {
+      const parsedVal = parseFloat(
+        String(row[valueField]).replace(/[^0-9\.-]/g, "")
+      );
+      if (Number.isFinite(parsedVal)) value = Math.abs(parsedVal);
+    }
+    if (!value || value <= 0) {
+      // Fallback heuristic if no value column found
+      value = quantity > 0 ? quantity * 10 : 5;
+    }
 
-[
-  {
-    "sku": "ABC-123",
-    "claimReason": "Warehouse Lost",
-    "quantity": 2,
-    "estimatedValue": 17.00,
-    "amazonTransactionId": "T123"
-  }
-]
+    const amazonTransactionId = txnField
+      ? String(row[txnField] || "").trim()
+      : "";
 
-If no valid claims exist, return [].
-No comments. No markdown. No text outside JSON.
+    const reasonRaw = reasonField ? String(row[reasonField] || "").trim() : "";
+    const claimReason =
+      reasonRaw ||
+      "Inventory discrepancy detected based on ledger / history records.";
+
+    const claim = {
+      sku: sku || `UNKNOWN-SKU-${i + 1}`,
+      quantity,
+      amazonTransactionId: amazonTransactionId || `N/A-${i + 1}`,
+      estimatedValue: value,
+      claimReason
+    };
+
+    totalEstimatedValue += value;
+    claims.push(claim);
+
+    const msg = {
+      sku: claim.sku,
+      reason: claimReason,
+      message: `Hello Amazon FBA Support,
+
+We have identified a potential inventory discrepancy for SKU ${claim.sku} in our inventory ledger / daily history report.
+
+Key details:
+- SKU: ${claim.sku}
+- Quantity affected: ${claim.quantity}
+- Estimated reimbursement value: $${claim.estimatedValue.toFixed(2)}
+- Reference / Transaction ID: ${claim.amazonTransactionId}
+
+Please investigate this discrepancy and reimburse any missing / damaged units according to your FBA reimbursement policy.
+
+Thank you.`
+    };
+    messages.push(msg);
+  }
+
+  return { claims, totalEstimatedValue, messages };
+}
+
+// Optional: ask OpenAI for a short overall summary (does NOT affect claims structure)
+async function maybeSummarizeWithOpenAI(claims, totalEstimatedValue, fileName) {
+  try {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return null;
+    if (!claims || claims.length === 0) return null;
+
+    const topClaims = claims.slice(0, 10);
+    const bulletLines = topClaims
+      .map(
+        (c, idx) =>
+          `${idx + 1}. SKU ${c.sku}, qty ${c.quantity}, approx $${c.estimatedValue.toFixed(
+            2
+          )}, reason: ${c.claimReason}`
+      )
+      .join("\n");
+
+    const prompt = `
+You are helping an Amazon FBA seller understand a reimbursement audit.
+
+Total estimated reimbursement: $${totalEstimatedValue.toFixed(2)}
+Report file name: ${fileName || "N/A"}
+
+Here are some of the top claim candidates:
+${bulletLines}
+
+Write a short (2–4 sentences) plain-English summary explaining what this audit found and what the seller should do next. Do NOT mention that you are an AI. Speak directly to the seller.
 `;
 
-    const payload = {
-      contents: [
-        {
-          parts: [{ text: prompt }],
-        },
-      ],
-    };
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "You are a concise FBA reimbursement audit assistant." },
+          { role: "user", content: prompt }
+        ],
+        temperature: 0.4,
+        max_tokens: 300
+      })
+    });
 
-    const gemResponse = await fetch(MODEL_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    if (!res.ok) {
+      console.error("OpenAI API error status:", res.status);
+      return null;
+    }
+    const data = await res.json();
+    const summary =
+      data.choices?.[0]?.message?.content?.trim() ||
+      null;
+    return summary;
+  } catch (err) {
+    console.error("Error calling OpenAI:", err);
+    return null;
+  }
+}
 
-    const gemData = await gemResponse.json();
+// ---------- ROUTES ----------
 
-    if (!gemResponse.ok) {
-      console.error("Gemini API Error:", gemData);
-      return res.status(500).json({
-        error: "Gemini API error",
-        details: gemData,
-      });
-    }
-
-    const aiText =
-      gemData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-
-    // Clean up possible ```json wrappers / trailing commas
-    let clean = aiText
-      .replace(/```json/gi, "")
-      .replace(/```/g, "")
-      .replace(/,\s*}/g, "}")
-      .replace(/,\s*]/g, "]");
-
-    let claims = [];
-    try {
-      claims = JSON.parse(clean);
-      // Calls the locally defined validation function
-      claims = validateClaims(claims);
-    } catch (err) {
-      console.error("JSON PARSE FAIL:", clean);
-      return res.status(500).json({
-        error: "AI returned invalid JSON",
-        raw: clean,
-      });
-    }
-
-    const totalEstimatedValue = claims.reduce(
-      (sum, c) => sum + (parseFloat(c.estimatedValue) || 0),
-      0
-    );
-
-    // Optional messages placeholder
-    const messages = [];
-
-    // --------------------------
-    // FIRESTORE: auditsUsed + history
-    // --------------------------
-    if (firestore && userId) {
-      try {
-        // Increment auditsUsed in limits doc
-        const limitsRef = userLimitsDoc(userId);
-
-        await firestore.runTransaction(async (tx) => {
-          const snap = await tx.get(limitsRef);
-          const data = snap.exists ? snap.data() : {};
-
-          const maxFreeAudits = data.maxFreeAudits ?? 5; // default 5 free
-          const newCount = (data.auditsUsed ?? 0) + 1;
-
-          tx.set(
-            limitsRef,
-            {
-              auditsUsed: newCount,
-              maxFreeAudits,
-            },
-            { merge: true }
-          );
-        });
-
-        // Append a history record
-        const historyRef = userHistoryCollection(userId);
-        await historyRef.add({
-          createdAt: FieldValue.serverTimestamp(),
-          fileName: fileName || "Unknown.csv",
-          totalEstimatedValue,
-          totalClaims: claims.length,
-          sampleSku: claims[0]?.sku || null,
-          sampleReason: claims[0]?.claimReason || null,
-        });
-      } catch (err) {
-        console.error("⚠️ Failed to update Firestore for audit:", err);
-      }
-    } else if (!firestore && userId) {
-      console.warn(
-        "⚠️ Firestore not initialized; cannot track audits/history."
-      );
-    }
-
-    return res.json({
-      claims,
-      totalEstimatedValue,
-      messages,
-    });
-  } catch (err) {
-    console.error("Server Error:", err);
-    return res.status(500).json({ error: "Server error", details: err });
-  }
+// Health check
+app.get("/", (req, res) => {
+  res.send("RefundHunter / FBA Money Scout backend is running.");
 });
 
-// ------------------------------
-// USER STATUS (for login gating + UI)
-// ------------------------------
-app.get("/api/user-status/:userId", async (req, res) => {
-  const { userId } = req.params;
-
-  if (!firestore) {
-    return res.status(500).json({ error: "Firestore not configured" });
-  }
-  if (!userId) {
-    return res.status(400).json({ error: "Missing userId" });
-  }
-
-  try {
-    const limitsSnap = await userLimitsDoc(userId).get();
-    const data = limitsSnap.exists ? limitsSnap.data() : {};
-
-    return res.json({
-      isPremium: !!data.isPremium,
-      auditsUsed: data.auditsUsed ?? 0,
-      maxFreeAudits: data.maxFreeAudits ?? 5,
-    });
-  } catch (err) {
-    console.error("Error fetching user status:", err);
-    return res.status(500).json({ error: "Failed to fetch user status" });
-  }
+app.get("/health", (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
 });
 
-// ------------------------------
-// AUDIT HISTORY FETCH
-// ------------------------------
-app.get("/api/audit-history/:userId", async (req, res) => {
-  const { userId } = req.params;
+/**
+ * POST /api/audit
+ * Body: { csvContent, fileName, userId }
+ * This is what your current frontend calls today.
+ */
+app.post("/api/audit", async (req, res) => {
+  try {
+    const { csvContent, fileName, userId } = req.body || {};
 
-  if (!firestore) {
-    return res.status(500).json({ error: "Firestore not configured" });
-  }
-  if (!userId) {
-    return res.status(400).json({ error: "Missing userId" });
-  }
+    if (!csvContent || typeof csvContent !== "string") {
+      return res.status(400).json({
+        error:
+          "csvContent string is required in the request body. (frontend currently uses JSON mode)"
+      });
+    }
 
-  try {
-    const snap = await userHistoryCollection(userId)
-      .orderBy("createdAt", "desc")
-      .limit(20)
-      .get();
+    const sizeMB =
+      Buffer.byteLength(csvContent, "utf8") / (1024 * 1024);
+    if (sizeMB > JSON_SIZE_LIMIT_MB) {
+      // Protect the instance and give a clear message
+      return res.status(413).json({
+        error: `CSV file too large for JSON upload mode (${sizeMB.toFixed(
+          1
+        )} MB). Please reduce date range or switch to file upload endpoint /api/audit-upload.`
+      });
+    }
 
-    const history = snap.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
+    let records;
+    try {
+      records = parse(csvContent, {
+        columns: true,
+        skip_empty_lines: true,
+        relax_column_count: true,
+        bom: true
+      });
+    } catch (csvErr) {
+      console.error("CSV parse error (JSON mode):", csvErr);
+      return res.status(400).json({
+        error:
+          "Failed to parse CSV content. Please ensure it's a valid Amazon CSV export."
+      });
+    }
 
-    return res.json({ history });
-  } catch (err) {
-    console.error("Error fetching audit history:", err);
-    return res.status(500).json({ error: "Failed to fetch audit history" });
-  }
+    // For safety, only use up to e.g. 10k rows in JSON mode
+    const MAX_ROWS_JSON_MODE = 10000;
+    if (records.length > MAX_ROWS_JSON_MODE) {
+      records = records.slice(0, MAX_ROWS_JSON_MODE);
+    }
+
+    const { claims, totalEstimatedValue, messages } =
+      buildClaimsFromRecords(records);
+
+    const summary = await maybeSummarizeWithOpenAI(
+      claims,
+      totalEstimatedValue,
+      fileName
+    );
+
+    return res.status(200).json({
+      claims,
+      totalEstimatedValue,
+      messages,
+      summary,
+      meta: {
+        mode: "json",
+        userId: userId || null,
+        truncatedRows: records.length > MAX_ROWS_JSON_MODE
+      }
+    });
+  } catch (err) {
+    console.error("Unhandled /api/audit error:", err);
+    return res.status(500).json({
+      error: "Internal error while analyzing report."
+    });
+  }
 });
 
-// ------------------------------
-// STRIPE: CREATE CHECKOUT SESSION
-// ------------------------------
-app.post("/api/create-checkout-session", async (req, res) => {
-  try {
-    const { priceId, userId, email } = req.body;
-
-    if (!priceId || !userId) {
-      return res
-        .status(400)
-        .json({ error: "Missing priceId or userId in request body." });
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      payment_method_types: ["card", "link"], // Enable card + Link
-
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
-
-      customer_email: email || undefined,
-
-      success_url: `${FRONTEND_URL}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${FRONTEND_URL}?canceled=1`,
-
-      metadata: {
-        firebaseUserId: userId,
-      },
-    });
-
-    return res.json({ url: session.url });
-  } catch (err) {
-    console.error("Stripe create-checkout-session error:", err);
-    return res
-      .status(500)
-      .json({ error: "Stripe error", details: err.message });
-  }
-});
-
-// ------------------------------
-// STRIPE WEBHOOK (subscription lifecycle)
-// ------------------------------
+/**
+ * POST /api/audit-upload
+ * multipart/form-data
+ * Fields:
+ *   - file: CSV file
+ *   - fileName (optional)
+ *   - userId  (optional)
+ *
+ * This is the **streaming** path for future very large files.
+ */
 app.post(
-  "/api/stripe-webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    let event;
-    const sig = req.headers["stripe-signature"];
+  "/api/audit-upload",
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res
+          .status(400)
+          .json({ error: "CSV file (field name 'file') is required." });
+      }
 
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error("❌ Webhook signature verification failed:", err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
+      const filePath = req.file.path;
+      const fileName = req.body.fileName || req.file.originalname;
+      const userId = req.body.userId || null;
 
-    if (!firestore) {
-      console.warn(
-        "⚠️ Webhook received but Firestore not initialized; cannot update premium flags."
-      );
-    }
+      const rows = [];
+      let rowCount = 0;
 
-    try {
-      switch (event.type) {
-        case "checkout.session.completed": {
-          const session = event.data.object;
-          const firebaseUserId = session.metadata?.firebaseUserId;
+      // Stream from disk to keep memory usage low
+      await new Promise((resolve, reject) => {
+        fs.createReadStream(filePath)
+          .pipe(csvStreamParser())
+          .on("data", (row) => {
+            rowCount++;
+            if (rows.length < MAX_CLAIMS * 4) {
+              // buffer enough rows to build claims, but don't keep everything
+              rows.push(row);
+            }
+          })
+          .on("end", resolve)
+          .on("error", reject);
+      });
 
-          if (firestore && firebaseUserId) {
-            await userLimitsDoc(firebaseUserId).set(
-              { isPremium: true },
-              { merge: true }
-            );
-            console.log("✅ Premium enabled after checkout:", firebaseUserId);
-          }
-          break;
-        }
+      // Clean up the temp file
+      try {
+        fs.unlinkSync(filePath);
+      } catch (e) {
+        console.warn("Failed to delete temp upload:", e);
+      }
 
-        case "customer.subscription.created":
-        case "customer.subscription.updated":
-        case "invoice.paid": {
-          const subscription = event.data.object;
-          const firebaseUserId = subscription.metadata?.firebaseUserId;
+      if (rows.length === 0) {
+        return res.status(200).json({
+          claims: [],
+          totalEstimatedValue: 0,
+          messages: [],
+          summary: null,
+          meta: {
+            mode: "upload",
+            userId,
+            rowCount: rowCount
+          }
+        });
+      }
 
-          if (firestore && firebaseUserId) {
-            await userLimitsDoc(firebaseUserId).set(
-              { isPremium: true },
-              { merge: true }
-            );
-            console.log("🔁 Subscription active/renewed:", firebaseUserId);
-          }
-          break;
-        }
+      const { claims, totalEstimatedValue, messages } =
+        buildClaimsFromRecords(rows);
 
-        case "customer.subscription.deleted":
-        case "invoice.payment_failed": {
-          const subscription = event.data.object;
-          const firebaseUserId = subscription.metadata?.firebaseUserId;
+      const summary = await maybeSummarizeWithOpenAI(
+        claims,
+        totalEstimatedValue,
+        fileName
+      );
 
-          if (firestore && firebaseUserId) {
-            await userLimitsDoc(firebaseUserId).set(
-              { isPremium: false },
-              { merge: true }
-            );
-            console.log("⚠️ Subscription canceled or past due:", firebaseUserId);
-          }
-          break;
-        }
-
-        default:
-          console.log("ℹ️ Unhandled Stripe event type:", event.type);
-      }
-
-      res.json({ received: true });
-    } catch (err) {
-      console.error("❌ Error handling webhook:", err);
-      res.status(500).send("Webhook handler error");
-    }
-  }
+      return res.status(200).json({
+        claims,
+        totalEstimatedValue,
+        messages,
+        summary,
+        meta: {
+          mode: "upload",
+          userId,
+          rowCount
+        }
+      });
+    } catch (err) {
+      console.error("Unhandled /api/audit-upload error:", err);
+      return res.status(500).json({
+        error: "Internal error while analyzing uploaded CSV."
+      });
+    }
+  }
 );
 
-// ------------------------------
-// START SERVER
-// ------------------------------
-const PORT = process.env.PORT || 8080;
-
+// ---------- START SERVER ----------
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 FBA Money Scout backend running on port ${PORT}`);
+  console.log(`RefundHunter backend listening on port ${PORT}`);
 });
